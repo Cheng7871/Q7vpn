@@ -1,51 +1,24 @@
-# NodeBox
+# Q7vpn V3 (Render-ready starter)
 
-一个适合部署到 Render 的简约节点管理器。
+A Flask web starter for account login/registration, persistent sessions, SS/VLESS URI node management, light/dark theme, basic security event logging, CSRF protection and rate limits.
 
-## 支持
+## Deploy on Render
+1. Upload the contents of this folder to a GitHub repository.
+2. Create a Render Web Service from that repository.
+3. Build command: `pip install -r requirements.txt`
+4. Start command: `gunicorn app:app`
+5. Health check path: `/health`
+6. Add environment variables:
+   - `SECRET_KEY`: long random secret (required; do not keep the development fallback)
+   - `IP_HASH_SALT`: random secret salt for IP hash identifiers
+   - `RATELIMIT_STORAGE_URI`: for production, use a Redis URL supplied by your provider
+   - `COOKIE_SECURE`: keep `1` when served over HTTPS
+7. Attach a persistent disk and set `Q7VPN_DB_PATH` to a path on that disk, e.g. `/var/data/q7vpn.sqlite3`, if you need account data to survive instance replacement. SQLite on ephemeral storage can be lost on redeploy.
 
-- 导入 TXT
-- `ss://`
-- `vless://`
-- 搜索
-- 复制节点 URI
-- 删除节点
-- 手动添加
-- 浏览器本地保存
-
-## 本地运行
-
-```bash
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-pip install -r requirements.txt
-python app.py
-```
-
-打开 `http://127.0.0.1:10000`
-
-## Render 部署
-
-把整个项目上传到 GitHub，然后在 Render 新建 Web Service。
-
-Build Command:
-
-```bash
-pip install -r requirements.txt
-```
-
-Start Command:
-
-```bash
-gunicorn app:app
-```
-
-也可以直接使用项目里的 `render.yaml`。
-
-## 说明
-
-这是“节点管理/解析”软件，不是 VPN 服务本身。它不会自动建立 VPN 隧道，也不会绕过第三方服务的登录或验证码。
+## Important limitations
+- This is a starter, not a production-audited identity system.
+- Phone number is collected as account recovery metadata only. It does not send SMS. Recovery uses a security answer, which is weaker than verified email/SMS/passkeys; for production, integrate a real verified recovery channel.
+- No external login, no real VPN tunnel, no embedded proxy core, and no packet capture engine. Node URI handoff is available through browser share/copy.
+- Basic Flask-Limiter limits are not a substitute for CDN/WAF DDoS mitigation. Use a reputable CDN/WAF, managed DDoS protection, persistent Redis-backed rate limiting, monitoring, backups, and security review before exposing this publicly.
+- The security page is audit logging, not a claim of blocking all attacks. This code intentionally excludes offensive CC flood, credential stuffing, and unauthorized packet interception features.
+- Node URIs may contain secrets. Treat them like passwords and avoid public sharing.
