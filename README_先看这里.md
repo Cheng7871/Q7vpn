@@ -1,54 +1,22 @@
-# Q7VPN V5：UI 与账户安全优化版
+# Q7VPN V5.2 合并优化版（Android 优先）
 
-本压缩包分为两个独立工程：
+本工程基于原始 V5.2 与修复版合并。当前优先目标是通过 GitHub Actions 构建安卓测试 APK，不再要求部署网站。
 
-- `web/`：Q7vpn Flask 网站管理器，可部署到 Render。
-- `android/`：Android 原生 MVP，导入 TXT、展示节点、做 TCP 端口可达性检测，并可把节点 URI 分享给兼容代理客户端。
+## 这次合并修改
+- 图片验证码调整为 4 位，输入框限制为 4 位，验证码图缩小并居中显示。
+- 手机端减少持续动画和背景模糊效果，降低 GPU 开销。
+- Android 原生节点列表换成轻量水晶玻璃风格。
+- TXT 节点本地持久化；后台并发检测 TCP 端口，批量完成后一次刷新界面，移除确认端口不可达的节点。
+- 添加 `.github/workflows/android-apk.yml`，推送到 GitHub 后可在 Actions 下载 debug APK。
 
-## 已实现
-- 网站：账户注册/登录、基础找回密码、节点导入/去重/删除/导出、安全事件页面、黑白主题、基础限流与 CSRF；V5 优化了登录/注册视觉、流光 Q7VPN 字标、底部导航、个人账户安全中心、唯一 Q7-数字 ID、ID 或用户名登录，以及当前密码验证后的修改密码流程。
-- Android：原生界面、文件选择器、SS/VLESS URI 基础解析、去重、TCP 延迟/可达性测试、节点选择、分享给兼容客户端。
+## 重要说明
+**当前 Android 代码还不是独立可用的 VPN。** 它没有 `VpnService` 隧道，也没有 VLESS/SS 协议核心；端口检测不能验证协议认证和真实流量转发。界面会明确说明这一限制，不会假装已经连接。请查看 `ANDROID_STATUS_AND_NEXT_STEPS.md`，其中列出了接入 sing-box/libbox 后成为真正 VPN 所需的工程步骤。
 
-## 未实现（重要）
-- Android 内嵌 sing-box/libbox 代理核心。
-- Q7vpn 自己的 `VpnService` 隧道生命周期、TUN 文件描述符与核心集成。
-- Q7vpn 自己弹出 Android VPN 权限窗口并在应用内完成连接。
-- 通过真实 IP 地理数据库确认国家。当前国家显示“未知地区”，不能凭节点名字推断国家。
-- 专属 ID 使用数据库用户主键生成，例如 `Q7-0000001`；ID 不是密码，登录仍需输入密码。
-- 免费节点的可用性保证。TCP 可达不代表协议握手/认证成功。
-- 网站和 Android 之间的账户同步 API、自动下发节点 API。
-- 短信验证、生产级找回密码和完整 DDoS 防护。
+## 在 GitHub 打包
+1. 将整个工程上传到 GitHub 仓库（保留 `.github/workflows/android-apk.yml`）。
+2. 打开仓库 **Actions**，运行 **Build Q7VPN Android APK**。
+3. 工作流成功后进入本次运行记录，在 Artifacts 下载 `Q7VPN-debug-apk`。
+4. 这是用于真机测试的 debug APK，不是应用商店正式签名包。
 
-因此，本版本是可继续开发的工程包，不应被描述为已完成的独立 VPN 产品。Android 的“交给客户端”会打开系统分享菜单，实际 VPN 连接由用户选择的兼容客户端完成。
-
-## Render 部署
-在 Render 创建 Web Service，仓库根目录可以设为 `web`，或将 `web/` 内容放在仓库根目录：
-- Build Command: `pip install -r requirements.txt`
-- Start Command: `gunicorn app:app`
-- Health Check Path: `/health`
-
-环境变量：
-- `SECRET_KEY`: 强随机密钥
-- `IP_HASH_SALT`: 独立随机盐
-- `RATELIMIT_STORAGE_URI`: 生产环境建议使用 Redis URL
-- `Q7VPN_DB_PATH`: 如要使用 SQLite，必须指向已挂载的持久化磁盘路径，例如 `/var/data/q7vpn.sqlite3`
-
-注意：Render 默认文件系统是临时的。持久化磁盘仅在付费 Web Service 等符合条件的服务中可用；生产应用更建议使用 Render Postgres。参考：https://render.com/docs/disks
-
-## Android 构建
-用 Android Studio 打开 `android/` 目录，等待 Gradle 同步，再使用 Build > Build APK(s)。当前没有附带 APK，因为生成环境没有 Android SDK 构建工具。
-
-## 下一步
-1. 验证网站部署与数据库持久化。
-2. 用自有/授权的有效节点测试 Android 导入。
-3. 决定内嵌 sing-box/libbox 的版本，并实现 Android 平台回调与 VPN Service 生命周期。
-4. 做协议握手、出口 IP、DNS、IPv4/IPv6、断线重连和隐私审查。
-
-## V5.2 视觉升级说明
-- 登录/注册页使用 Q7VPN 大字标识、科幻氛围背景和水晶玻璃质感控件。
-- 登录后控制台增加动态渐变氛围背景、玻璃卡片和流光按钮。
-- 中文/英文、主题、强调色设置位于页面顶部控制区；移动端尽量保留全部入口。
-- 原有底部导航继续承载首页、节点、导入、安全中心和退出登录。
-- 动画支持系统“减少动态效果”偏好。
-
-注意：本次主要为前端视觉增强，不代表 Android 原生 VPN 隧道已实现，也未代替 Render 线上部署与浏览器验收。
+## 华为 Mate 50 Pro
+`minSdk 26` 满足基础系统版本要求，但必须在真机测试文件选择器、节点 DNS/端口可达性、后台运行、电池优化和后续 VPN 授权/断连流程。
