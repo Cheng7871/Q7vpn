@@ -6,8 +6,10 @@ This merged project incorporates the repaired V5.2 web code and Android MVP. The
 - CAPTCHA is four characters; the image and input sizing are reduced and centered for narrow screens.
 - Mobile page animations and backdrop blur are reduced to avoid unnecessary GPU work.
 - Android node list uses a lightweight glass-like dark UI.
-- TXT import persists nodes. TCP reachability checks run off the UI thread and update the list once after the batch; confirmed TCP failures are removed automatically.
-- GitHub Actions workflow builds a debug APK and uploads it as an artifact.
+- TXT import persists nodes and starts a background TCP reachability filter automatically after successful imports.
+- Duplicate detection uses a hash set during import to avoid quadratic scans on large TXT files.
+- The Android node list renders in pages of 80 items to reduce UI jank for large imports.
+- GitHub Actions pins Android command-line tools and explicitly installs platform-tools, Android 35 platform, and build-tools 35.0.0; the workflow emits stack traces if Gradle fails.
 
 ## Important: not yet a standalone VPN
 The current Android code does **not** implement an Android `VpnService` tunnel and does **not** include a proxy protocol core. TCP port reachability is not proof that VLESS/SS authentication or traffic routing works. This merge must not be advertised as a working standalone VPN yet.
@@ -19,5 +21,7 @@ To become a real VPN client, a follow-up engineering phase must pin and integrat
 2. Open **Actions** and run **Build Q7VPN Android APK** (or push changes to `main`/`master`).
 3. Open the completed workflow run and download the `Q7VPN-debug-apk` artifact.
 4. This is a debug-signed APK for testing, not a Play Store release.
+
+The Android VPN tunnel is still not implemented in this revision. No `VpnService`/libbox integration was added because the repository does not yet contain a pinned, integrated proxy-core API implementation; adding a service declaration alone would not make it a working VPN. The next phase must implement and test the actual core integration before claiming standalone VPN capability.
 
 Huawei Mate 50 Pro compatibility still needs physical-device testing. `minSdk 26` is compatible with the Android API baseline, but OEM battery/background policies and VPN behavior must be verified on-device.
