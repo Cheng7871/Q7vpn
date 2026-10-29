@@ -3,6 +3,7 @@ package com.q7vpn.app;
 import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
@@ -24,11 +25,17 @@ import java.util.ArrayList;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final int PICK_TXT = 77;
+    private static final String PREFS = "q7vpn";
+    private static final String KEY_NODES = "saved_nodes";
+    private static final String KEY_SELECTED = "selected_uri";
+    private static final int MAX_PROBE_THREADS = 16;
     private final ArrayList<Node> nodes = new ArrayList<>();
-    private final ExecutorService executor = Executors.newFixedThreadPool(4);
+    private ExecutorService executor = Executors.newFixedThreadPool(4);
     private LinearLayout list;
     private TextView summary;
     private TextView status;
@@ -45,10 +52,44 @@ public class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        loadNodes();          // 节点本来只存在内存里，进程一被杀就全丢
         buildUi();
     }
 
+    private void loadNodes() {
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_NODES, "");
+        String selectedUri = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_SELECTED, "");
+        for (String line : raw.split("\n")) {
+            if (line.trim().isEmpty()) continue;
+            Node n = parse(line);
+            if (n == null) continue;
+            nodes.add(n);
+            if (!selectedUri.isEmpty() && selectedUri.equals(n.uri)) selected = n;
+        }
+    }
+
+    private void persistNodes() {
+        StringBuilder sb = new StringBuilder();
+        for (Node n : nodes) sb.append(n.uri).append('\n');
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_NODES, sb.toString())
+                .putString(KEY_SELECTED, selected == null ? "" : selected.uri)
+                .apply();
+    }
+
     private int dp(float v) { return (int)(v * getResources().getDisplayMetrics().density + 0.5f); }
+    private GradientDrawable rounded(int color, int stroke, float radiusDp) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color); d.setCornerRadius(dp(radiusDp));
+        if (stroke != 0) d.setStroke(dp(1), stroke);
+        return d;
+    }
+    private void styleButton(Button b, boolean primary) {
+        b.setAllCaps(false); b.setTextSize(13); b.setTextColor(primary ? Color.rgb(8,18,31) : Color.rgb(224,238,250));
+        b.setBackground(rounded(primary ? Color.rgb(133,231,239) : Color.rgb(29,39,59),
+                primary ? Color.rgb(172,248,255) : Color.rgb(81,143,173), 14));
+        b.setMinHeight(dp(46)); b.setElevation(0);
+    }
     private TextView text(String value, int size, int color) {
         TextView t = new TextView(this);
         t.setText(value); t.setTextSize(size); t.setTextColor(color);
@@ -60,17 +101,17 @@ public class MainActivity extends Activity {
         int bg = Color.rgb(9,11,18), fg = Color.rgb(247,247,251), muted = Color.rgb(148,153,173);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(20), dp(24), dp(20), dp(18));
-        root.setBackgroundColor(bg);
+        root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{Color.rgb(7,13,25), Color.rgb(13,18,36), Color.rgb(22,19,43)}));
 
-        TextView title = text("Q7vpn", 34, fg); title.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text("Q7VPN", 32, fg); title.setGravity(Gravity.CENTER_VERTICAL);
         title.setTypeface(null, 1); root.addView(title);
         TextView subtitle = text("节点 · 诊断 · 安全连接", 14, muted);
         root.addView(subtitle, new LinearLayout.LayoutParams(-1, dp(32)));
 
         LinearLayout actions = new LinearLayout(this); actions.setOrientation(LinearLayout.HORIZONTAL);
-        Button importBtn = new Button(this); importBtn.setText("导入 TXT");
+        Button importBtn = new Button(this); importBtn.setText("导入 TXT"); styleButton(importBtn, true);
         importBtn.setOnClickListener(v -> pickTxt());
-        Button testBtn = new Button(this); testBtn.setText("检测延迟");
+        Button testBtn = new Button(this); testBtn.setText("筛选节点"); styleButton(testBtn, false);
         testBtn.setOnClickListener(v -> testAll());
         actions.addView(importBtn, new LinearLayout.LayoutParams(0, dp(52), 1));
         actions.addView(testBtn, new LinearLayout.LayoutParams(0, dp(52), 1));
@@ -78,16 +119,16 @@ public class MainActivity extends Activity {
 
         summary = text("0 个节点 · 尚未检测", 15, muted);
         summary.setPadding(0, dp(12), 0, dp(8)); root.addView(summary);
-        status = text("选择节点后，点击“交给客户端”可在兼容的代理客户端中继续连接。", 13, muted);
+        status = text("导入 TXT 后可筛选端口不可达节点；当前版本尚未内置 VPN 隧道内核。", 13, muted);
         status.setPadding(dp(14), dp(12), dp(14), dp(12));
-        status.setBackgroundColor(Color.rgb(25,28,40)); root.addView(status);
+        status.setBackground(rounded(Color.rgb(25,32,49), Color.rgb(58,91,120), 16)); root.addView(status);
 
         ScrollView scroll = new ScrollView(this);
         list = new LinearLayout(this); list.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(list);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        TextView foot = text("说明：当前版本管理节点并交接给兼容客户端；尚未内置 VPN 代理核心。", 12, muted);
+        TextView foot = text("说明：当前版本是节点管理器，尚未内置 VPN 隧道内核；不会伪报“已连接”。", 12, muted);
         foot.setPadding(0, dp(12), 0, 0); root.addView(foot);
         setContentView(root);
         redraw();
@@ -116,6 +157,7 @@ public class MainActivity extends Activity {
                 for (Node old : nodes) if (old.uri.equals(n.uri)) { dup = true; break; }
                 if (dup) duplicates++; else { nodes.add(n); added++; }
             }
+            persistNodes();
             summary.setText(nodes.size() + " 个节点 · 新增 " + added + " · 重复 " + duplicates + " · 无效 " + invalid);
             status.setText("已导入配置。导入成功不代表节点可用；请运行延迟检测。");
             redraw();
@@ -150,24 +192,48 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    private volatile boolean checking = false;
     private void testAll() {
+        if (checking) { Toast.makeText(this, "正在筛选，请稍候", Toast.LENGTH_SHORT).show(); return; }
         if (nodes.isEmpty()) { Toast.makeText(this, "请先导入 TXT", Toast.LENGTH_SHORT).show(); return; }
-        status.setText("正在检测 TCP 端口可达性…这不是完整代理握手测试。");
-        for (Node n : nodes) {
-            if (n.host == null || n.host.isEmpty() || n.port < 1 || n.port > 65535) {
-                n.latency = "无法检测"; continue;
-            }
-            executor.execute(() -> {
-                long start = System.nanoTime();
-                String result;
-                try (Socket s = new Socket()) {
-                    s.connect(new InetSocketAddress(n.host, n.port), 2500);
-                    result = ((System.nanoTime()-start)/1_000_000L) + " ms";
-                } catch (Exception e) { result = "不可达"; }
-                final String value = result;
-                runOnUiThread(() -> { n.latency = value; redraw(); });
+        checking = true;
+        status.setText("正在后台筛选端口不可达的节点…不会阻塞界面。端口可达不等于协议握手成功。");
+        final ArrayList<Node> snapshot = new ArrayList<>(nodes);
+        final int pool = Math.max(2, Math.min(snapshot.size(), MAX_PROBE_THREADS));
+        final ExecutorService workers = Executors.newFixedThreadPool(pool);
+        final CountDownLatch done = new CountDownLatch(snapshot.size());
+        for (Node n : snapshot) {
+            workers.execute(() -> {
+                try {
+                    if (n.host == null || n.host.isEmpty() || n.port < 1 || n.port > 65535) {
+                        n.latency = "无法检测";
+                    } else {
+                        long start = System.nanoTime();
+                        try (Socket socket = new Socket()) {
+                            socket.connect(new InetSocketAddress(n.host, n.port), 1800);
+                            n.latency = ((System.nanoTime() - start) / 1_000_000L) + " ms";
+                        } catch (Exception ex) { n.latency = "不可达"; }
+                    }
+                } finally { done.countDown(); }
             });
         }
+        new Thread(() -> {
+            try { done.await(8, TimeUnit.MINUTES); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            workers.shutdownNow();
+            runOnUiThread(() -> {
+                int before = nodes.size();
+                // Automatically remove only confirmed TCP failures. Unsupported URI formats remain for safety.
+                nodes.removeIf(n -> "不可达".equals(n.latency));
+                int removed = before - nodes.size();
+                if (selected != null && !nodes.contains(selected)) selected = null;
+                persistNodes();
+                summary.setText(nodes.size() + " 个节点保留 · 已移除端口不可达 " + removed + " 个");
+                status.setText("筛选完成。这里只检测服务器端口；要确认 VLESS/SS 真正可用，仍需内置代理核心进行协议握手。可选择节点交给兼容客户端。 ");
+                checking = false;
+                redraw();
+            });
+        }, "q7vpn-check-complete").start();
     }
 
     private void redraw() {
@@ -177,15 +243,15 @@ public class MainActivity extends Activity {
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL); card.setPadding(dp(16),dp(14),dp(16),dp(14));
             LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-1, -2); cp.setMargins(0,dp(8),0,dp(4));
-            card.setBackgroundColor(Color.rgb(23,26,37)); list.addView(card, cp);
+            card.setBackground(rounded(Color.rgb(22,29,45), Color.rgb(54,85,113), 18)); list.addView(card, cp);
 
             TextView name = text(n.name, 17, Color.WHITE); name.setTypeface(null,1); card.addView(name);
             TextView meta = text(n.protocol + "  ·  " + n.host + (n.port > 0 ? ":"+n.port : "") + "  ·  " + n.country + "  ·  " + n.latency, 12, Color.rgb(159,164,185));
             meta.setPadding(0,dp(6),0,dp(8)); card.addView(meta);
             LinearLayout row = new LinearLayout(this);
-            Button select = new Button(this); select.setText(selected == n ? "已选择" : "选择");
-            select.setOnClickListener(v -> { selected=n; status.setText("已选择："+n.name+"。点击“交给客户端”继续连接。"); redraw(); });
-            Button share = new Button(this); share.setText("交给客户端");
+            Button select = new Button(this); select.setText(selected == n ? "已选择" : "选择"); styleButton(select, selected == n);
+            select.setOnClickListener(v -> { selected=n; persistNodes(); status.setText("已选择："+n.name+"。点击“交给客户端”继续连接。"); redraw(); });
+            Button share = new Button(this); share.setText("交给客户端"); styleButton(share, false);
             share.setOnClickListener(v -> handoff(n));
             row.addView(select, new LinearLayout.LayoutParams(0,dp(48),1));
             row.addView(share, new LinearLayout.LayoutParams(0,dp(48),1));
@@ -208,8 +274,9 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        super.onDestroy();
+        persistNodes();
         executor.shutdownNow();
+        super.onDestroy();
     }
 
     // A named marker to avoid adding dependencies for a custom drawable/button library.
