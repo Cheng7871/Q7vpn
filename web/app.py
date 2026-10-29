@@ -1,18 +1,55 @@
 import os, re, json, sqlite3, secrets, hashlib, hmac, time
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import urlparse, parse_qs, unquote
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, abort, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFProtect, CSRFError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 APP_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.environ.get("Q7VPN_DB_PATH", os.path.join(APP_DIR, "q7vpn.sqlite3"))
+TZ_OFFSET = float(os.environ.get("Q7VPN_TZ_OFFSET", "8"))  # 默认北京时间
+
+
+def _ensure_parent_dir(path):
+    """A missing directory (e.g. an unmounted /var/data disk) makes sqlite3 fail hard at import time."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            pass
+
+
+def _resolve_secret_key():
+    """Keep sessions alive across restarts when SECRET_KEY is not provided via env."""
+    env_secret = os.environ.get("SECRET_KEY", "").strip()
+    if env_secret:
+        return env_secret
+    key_file = os.path.join(APP_DIR, "instance", "secret_key")
+    try:
+        if os.path.isfile(key_file):
+            with open(key_file, "r", encoding="utf-8") as fh:
+                stored = fh.read().strip()
+            if len(stored) >= 32:
+                return stored
+        generated = secrets.token_hex(32)
+        os.makedirs(os.path.dirname(key_file), exist_ok=True)
+        with open(key_file, "w", encoding="utf-8") as fh:
+            fh.write(generated)
+        os.chmod(key_file, 0o600)
+        return generated
+    except OSError:
+        return secrets.token_hex(32)
+
+
+_ensure_parent_dir(DB_PATH)
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "CHANGE-ME-before-deploy-" + secrets.token_hex(16))
+app.secret_key = _resolve_secret_key()
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -24,55 +61,87 @@ app.config.update(
 csrf = CSRFProtect(app)
 limiter = Limiter(get_remote_address, app=app, default_limits=["300 per hour"], storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"))
 
-def db():
-    con = sqlite3.connect(DB_PATH)
+
+def _connect():
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=15000")
+    con.execute("PRAGMA foreign_keys=ON")
     return con
+
+
+@contextmanager
+def db():
+    """Every caller used to leak its connection: sqlite3's own context manager only commits, never closes.
+    Leaked handles plus nested writes are what produced `database is locked` under load."""
+    con = _connect()
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 @app.template_filter("timestamp_datetime")
 def timestamp_datetime(value):
     try:
-        return datetime.fromtimestamp(int(value)).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError, OSError):
+        return datetime.fromtimestamp(int(value), timezone(timedelta(hours=TZ_OFFSET))).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
         return "—"
 
-def init_db():
-    with db() as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            security_question TEXT NOT NULL,
-            security_answer_hash TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS security_events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            detail TEXT NOT NULL,
-            ip_hash TEXT NOT NULL,
-            user_id INTEGER
-        )""")
-        # Safe migration for databases created by earlier Q7vpn versions.
-        event_columns = {row[1] for row in con.execute("PRAGMA table_info(security_events)").fetchall()}
-        if "user_id" not in event_columns:
-            con.execute("ALTER TABLE security_events ADD COLUMN user_id INTEGER")
-        con.execute("""CREATE TABLE IF NOT EXISTS nodes(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            uri TEXT NOT NULL,
-            name TEXT NOT NULL,
-            UNIQUE(user_id, uri),
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS auth_ip_guard(
-            ip_hash TEXT PRIMARY KEY,
-            fail_count INTEGER NOT NULL DEFAULT 0,
-            window_start INTEGER NOT NULL,
-            locked_until INTEGER NOT NULL DEFAULT 0
-        )""")
+def init_db(retries=5):
+    """Retried because gunicorn boots several workers that race on CREATE TABLE."""
+    for attempt in range(retries):
+        try:
+            with db() as con:
+                try:
+                    con.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.DatabaseError:
+                    pass  # network filesystems refuse WAL; the busy_timeout still covers us
+                con.execute("""CREATE TABLE IF NOT EXISTS users(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    security_question TEXT NOT NULL,
+                    security_answer_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )""")
+                con.execute("""CREATE TABLE IF NOT EXISTS security_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    ip_hash TEXT NOT NULL,
+                    user_id INTEGER
+                )""")
+                # Safe migration for databases created by earlier Q7vpn versions.
+                event_columns = {row[1] for row in con.execute("PRAGMA table_info(security_events)").fetchall()}
+                if "user_id" not in event_columns:
+                    con.execute("ALTER TABLE security_events ADD COLUMN user_id INTEGER")
+                con.execute("""CREATE TABLE IF NOT EXISTS nodes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    uri TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    UNIQUE(user_id, uri),
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )""")
+                con.execute("""CREATE TABLE IF NOT EXISTS auth_ip_guard(
+                    ip_hash TEXT PRIMARY KEY,
+                    fail_count INTEGER NOT NULL DEFAULT 0,
+                    window_start INTEGER NOT NULL,
+                    locked_until INTEGER NOT NULL DEFAULT 0
+                )""")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON security_events(user_id, id DESC)")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_nodes_user ON nodes(user_id, id DESC)")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == retries - 1:
+                raise
+            time.sleep(0.3 * (attempt + 1))
 
 def log_event(category, detail, user_id=None):
     ip_hash = client_ip_hash()
@@ -157,7 +226,7 @@ def clear_auth_failures():
 
 
 def new_captcha():
-    session["q7_captcha"] = "".join(secrets.choice("23456789ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(5))
+    session["q7_captcha"] = "".join(secrets.choice("23456789ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(4))
     session["q7_captcha_at"] = int(time.time())
 
 
@@ -175,7 +244,7 @@ def captcha_image():
         new_captcha()
     chars = session["q7_captcha"]
     lines = []
-    for i in range(5):
+    for i in range(4):
         x1, y1 = secrets.randbelow(210), secrets.randbelow(54)
         x2, y2 = secrets.randbelow(210), secrets.randbelow(54)
         hue = secrets.choice([178, 205, 250, 280])
@@ -184,7 +253,7 @@ def captcha_image():
     for i, ch in enumerate(chars):
         y = 35 + secrets.randbelow(9) - 4
         rotate = secrets.randbelow(25) - 12
-        x = 27 + i * 38
+        x = 42 + i * 45
         fill = secrets.choice(["#e8fbff", "#a9f3f0", "#c9baff"])
         text_nodes.append(f'<text x="{x}" y="{y}" transform="rotate({rotate} {x} {y})" fill="{fill}" font-size="25" font-weight="800">{ch}</text>')
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="220" height="54" viewBox="0 0 220 54">'
@@ -213,9 +282,11 @@ def auth():
         session.pop("q7_captcha", None)
         session.pop("q7_captcha_at", None)
         if not captcha_fresh or not captcha_expected or not hmac.compare_digest(captcha_input, captcha_expected):
-            remaining = record_auth_failure()
+            # A mistyped captcha must not burn one of the five password attempts: users who
+            # fumble the image three times were getting locked out of their own account.
+            # Brute force is still bounded by the 20/minute limiter on this route.
             new_captcha()
-            flash("验证码错误次数过多，已锁定 5 分钟。" if remaining else "图片验证码不正确或已过期，请重新识别。", "error")
+            flash("图片验证码不正确或已过期，请重新识别。", "error")
             return render_auth_page(mode)
 
         if mode == "register":
@@ -298,16 +369,22 @@ def recover():
             answer = request.form.get("answer", "").strip().casefold()
             new_password = request.form.get("new_password", "")
             uname = session.get("recover_user")
+            reset_user_id = None
             with db() as con:
                 user = con.execute("SELECT * FROM users WHERE username=?", (uname,)).fetchone() if uname else None
                 if user and check_password_hash(user["security_answer_hash"], answer) and len(new_password) >= 10:
                     con.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(new_password), user["id"]))
-                    session.pop("recover_user", None)
-                    log_event("account", "密码重置")
-                    flash("密码已重置，请重新登录。", "success")
-                    return redirect(url_for("auth"))
-                question = user["security_question"] if user else None
-                flash("验证失败，或新密码不足 10 位。", "error")
+                    reset_user_id = user["id"]
+                else:
+                    question = user["security_question"] if user else None
+            if reset_user_id:
+                # Written after the transaction closes: logging inside the block opened a second
+                # connection and deadlocked on the first one's write lock.
+                session.pop("recover_user", None)
+                log_event("account", "通过安全问题重置密码", user_id=reset_user_id)
+                flash("密码已重置，请重新登录。", "success")
+                return redirect(url_for("auth"))
+            flash("验证失败，或新密码不足 10 位。", "error")
     return render_template("recover.html", question=question)
 
 @app.route("/logout", methods=["POST"])
@@ -346,6 +423,7 @@ def import_nodes():
 
 @app.post("/api/nodes/<int:node_id>/delete")
 @logged_in
+@limiter.limit("60 per minute")
 def delete_node(node_id):
     with db() as con:
         con.execute("DELETE FROM nodes WHERE id=? AND user_id=?", (node_id, session["user_id"]))
@@ -353,6 +431,7 @@ def delete_node(node_id):
 
 @app.get("/api/nodes/export")
 @logged_in
+@limiter.limit("60 per minute")
 def export_nodes():
     from flask import Response
     with db() as con:
@@ -399,13 +478,49 @@ def change_password():
     return redirect(url_for("security") + "#password")
 
 @app.get("/health")
+@limiter.exempt
 def health():
-    return jsonify(status="ok", app="Q7VPN", version="5.0")
+    """Exempt from the 300/hour default: platform health checks alone would trip it and take the site down."""
+    return jsonify(status="ok", app="Q7VPN", version="5.2.1")
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    return response
+
+
+@app.errorhandler(CSRFError)
+def csrf_failed(_):
+    flash("安全令牌已失效（页面可能停留过久），请重新提交。", "error")
+    return redirect(url_for("dashboard") if session.get("user_id") else url_for("auth"))
+
 
 @app.errorhandler(413)
 def too_large(_):
     return "上传内容过大（上限 1 MB）。", 413
 
+
+@app.errorhandler(429)
+def rate_limited(_):
+    # Must stay a 429: returning a bare string body from a handler silently downgrades to 200
+    # and turns "you are being rate limited" into what looks like a successful request.
+    page = os.path.join(APP_DIR, "templates", "rate_limited.html")
+    if os.path.exists(page):
+        return render_template("rate_limited.html"), 429
+    return "请求过于频繁，请稍后再试。", 429
+
+
+if os.environ.get("Q7VPN_RATELIMIT_OFF") == "1":
+    # Local load-testing only. Never set this on a public deployment.
+    limiter.enabled = False
+
 init_db()
 if __name__ == "__main__":
+    if app.config["SESSION_COOKIE_SECURE"] and os.environ.get("COOKIE_SECURE") is None:
+        app.logger.warning("SESSION_COOKIE_SECURE=1：若用 http:// 直接访问，浏览器不会回传会话 Cookie，"
+                           "登录会静默失败。本地自测请设 COOKIE_SECURE=0。")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
