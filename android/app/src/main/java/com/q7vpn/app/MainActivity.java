@@ -22,6 +22,7 @@ import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,12 +35,14 @@ public class MainActivity extends Activity {
     private static final String KEY_NODES = "saved_nodes";
     private static final String KEY_SELECTED = "selected_uri";
     private static final int MAX_PROBE_THREADS = 16;
+    private static final int NODE_PAGE_SIZE = 80;
     private final ArrayList<Node> nodes = new ArrayList<>();
     private ExecutorService executor = Executors.newFixedThreadPool(4);
     private LinearLayout list;
     private TextView summary;
     private TextView status;
     private Node selected;
+    private int visibleNodeCount = NODE_PAGE_SIZE;
 
     static class Node {
         String uri, name, protocol, host, country = "未知地区";
@@ -146,6 +149,8 @@ public class MainActivity extends Activity {
         if (requestCode != PICK_TXT || resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri file = data.getData();
         int added = 0, duplicates = 0, invalid = 0;
+        HashSet<String> seenUris = new HashSet<>();
+        for (Node existing : nodes) seenUris.add(existing.uri);
         try (BufferedReader br = new BufferedReader(new InputStreamReader(getContentResolver().openInputStream(file), StandardCharsets.UTF_8))) {
             String line;
             while ((line = br.readLine()) != null && nodes.size() < 3000) {
@@ -153,14 +158,15 @@ public class MainActivity extends Activity {
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 Node n = parse(line);
                 if (n == null) { invalid++; continue; }
-                boolean dup = false;
-                for (Node old : nodes) if (old.uri.equals(n.uri)) { dup = true; break; }
-                if (dup) duplicates++; else { nodes.add(n); added++; }
+                if (!seenUris.add(n.uri)) duplicates++;
+                else { nodes.add(n); added++; }
             }
             persistNodes();
+            visibleNodeCount = NODE_PAGE_SIZE;
             summary.setText(nodes.size() + " 个节点 · 新增 " + added + " · 重复 " + duplicates + " · 无效 " + invalid);
-            status.setText("已导入配置。导入成功不代表节点可用；请运行延迟检测。");
+            status.setText("已导入配置，正在后台自动筛选端口不可达的节点。端口可达不代表协议一定可用。");
             redraw();
+            if (added > 0) testAll();
         } catch (Exception e) {
             Toast.makeText(this, "读取文件失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
         }
@@ -239,7 +245,9 @@ public class MainActivity extends Activity {
     private void redraw() {
         if (list == null) return;
         list.removeAllViews();
-        for (Node n : nodes) {
+        int shown = Math.min(nodes.size(), visibleNodeCount);
+        for (int i = 0; i < shown; i++) {
+            Node n = nodes.get(i);
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL); card.setPadding(dp(16),dp(14),dp(16),dp(14));
             LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-1, -2); cp.setMargins(0,dp(8),0,dp(4));
@@ -256,6 +264,16 @@ public class MainActivity extends Activity {
             row.addView(select, new LinearLayout.LayoutParams(0,dp(48),1));
             row.addView(share, new LinearLayout.LayoutParams(0,dp(48),1));
             card.addView(row);
+        }
+        if (shown < nodes.size()) {
+            Button more = new Button(this);
+            more.setText("显示更多节点（" + shown + "/" + nodes.size() + "）");
+            styleButton(more, false);
+            more.setOnClickListener(v -> {
+                visibleNodeCount = Math.min(nodes.size(), visibleNodeCount + NODE_PAGE_SIZE);
+                redraw();
+            });
+            list.addView(more);
         }
     }
 
